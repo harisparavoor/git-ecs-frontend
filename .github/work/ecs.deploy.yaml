@@ -1,0 +1,209 @@
+name: Build and Deploy to ECS
+
+# Trigger: runs automatically on a push to ANY branch. No branch name is
+# hardcoded here -- whichever branch receives the push is the one that
+# triggers this workflow and gets built/deployed.
+on:
+  push: {}
+
+# Required for requesting the OIDC token used to assume the AWS IAM role.
+permissions:
+  id-token: write
+  contents: read
+
+# ---------------------------------------------------------------------------
+# ALL environment-specific values below are read from GitHub repo/org
+# "Variables" (vars.*) or "Secrets" (secrets.*). Nothing is hardcoded.
+#
+# Configure these in: Repo -> Settings -> Secrets and variables -> Actions
+#
+# Variables tab (non-sensitive):
+#   AWS_REGION                   e.g. ap-south-1
+#   project_name                 e.g. myproj
+#   environment                  e.g. dev / staging / prod
+#   app                          e.g. frontend
+#   frontend_repository_name     ECR repo name for this app
+#   ALB_NAME                     name of the ALB fronting the backend
+#                                 (assumed pattern: <project_name>-<environment>-alb)
+#   BACKEND_PORT                 port the backend listens on, e.g. 8080
+#
+# Secrets tab (sensitive):
+#   AWS_ROLE_ARN                 IAM role ARN GitHub OIDC will assume
+#     (must trust token.actions.githubusercontent.com for this repo)
+# ---------------------------------------------------------------------------
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECS_CLUSTER: "${{ vars.project_name }}-${{ vars.environment }}-cluster"
+  ECS_SERVICE: "${{ vars.project_name }}-${{ vars.environment }}-${{ vars.app }}-service"
+  ECS_TASK_DEFINITION_FAMILY: "${{ vars.project_name }}-${{ vars.app }}-${{ vars.environment }}"
+  ECS_CONTAINER_NAME: ${{ vars.app }}
+  ECR_REPOSITORY: "${{ vars.project_name }}-${{ vars.app }}-${{ vars.environment }}"
+  # Name of the ALB to look up at runtime (must match what Terraform created).
+  # Assumed naming convention below -- change if your ALB name differs.
+  ALB_NAME: "${{ vars.project_name }}-${{ vars.environment }}-alb"
+  BACKEND_PORT: ${{ vars.BACKEND_PORT }}
+
+jobs:
+  deploy:
+    name: Build, Push & Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      # -----------------------------------------------------------------
+      # 0. Fail fast if any required repo Variable/Secret is missing.
+      #    Same defensive pattern as your terraform.tfvars example.
+      # -----------------------------------------------------------------
+      - name: Validate required configuration
+        shell: bash
+        env:
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          missing=0
+          check() {
+            if [ -z "${!1:-}" ]; then
+              echo "ERROR: required value '$1' is empty or not configured."
+              missing=1
+            fi
+          }
+          check AWS_REGION
+          check ECR_REPOSITORY
+          check ECS_CLUSTER
+          check ECS_SERVICE
+          check ECS_TASK_DEFINITION_FAMILY
+          check ECS_CONTAINER_NAME
+          check ALB_NAME
+          check BACKEND_PORT
+          check AWS_ROLE_ARN
+          if [ "$missing" -eq 1 ]; then
+            echo "One or more required GitHub Variables/Secrets are missing. Aborting."
+            exit 1
+          fi
+          echo "All required configuration values are present."
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------
+      # Optional sanity build of the app before containerizing.
+      # Remove this step if your Docker build already handles install/build.
+      # -----------------------------------------------------------------
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        shell: bash
+        run: npm ci
+
+      # -----------------------------------------------------------------
+      # AWS auth via OIDC -- no long-lived access keys stored anywhere.
+      # -----------------------------------------------------------------
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # -----------------------------------------------------------------
+      # Look up the ALB's live DNS name (created by Terraform) and build
+      # REACT_APP_BACKEND_URL from it. This can't be a static repo Variable
+      # since the DNS name only exists once the ALB is provisioned --
+      # it's fetched fresh from AWS on every run instead.
+      # -----------------------------------------------------------------
+      - name: Resolve backend URL from ALB DNS name
+        shell: bash
+        run: |
+          set -euo pipefail
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --names "$ALB_NAME" \
+            --query "LoadBalancers[0].DNSName" \
+            --output text)
+
+          if [ -z "$ALB_DNS" ] || [ "$ALB_DNS" == "None" ]; then
+            echo "ERROR: Could not resolve DNS name for ALB '$ALB_NAME'. Check ALB_NAME matches the actual load balancer name."
+            exit 1
+          fi
+
+          echo "Resolved ALB DNS: $ALB_DNS"
+          echo "REACT_APP_BACKEND_URL=http://${ALB_DNS}:${BACKEND_PORT}" >> "$GITHUB_ENV"
+
+      # -----------------------------------------------------------------
+      # Replace placeholder in webpack.config.js with the real backend URL.
+      # Equivalent to your buildspec.yaml pre_build phase:
+      #   sed -i "s|{{REACT_APP_BACKEND_URL}}|$REACT_APP_BACKEND_URL|g" webpack.config.js
+      # REACT_APP_BACKEND_URL is available here because the previous step
+      # wrote it to $GITHUB_ENV after resolving the ALB's live DNS name.
+      # -----------------------------------------------------------------
+      - name: Replace placeholders in webpack.config.js
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${REACT_APP_BACKEND_URL:-}" ]; then
+            echo "ERROR: REACT_APP_BACKEND_URL is empty. Check the 'REACT_APP_BACKEND_URL' repo Variable."
+            exit 1
+          fi
+          sed -i "s|{{REACT_APP_BACKEND_URL}}|$REACT_APP_BACKEND_URL|g" webpack.config.js
+          echo "webpack.config.js after replacement:"
+          cat webpack.config.js
+
+      # -----------------------------------------------------------------
+      # Build & push the Docker image. Mirrors your buildspec.yaml:
+      # build-arg for REACT_APP_BACKEND_URL, tag with short commit hash,
+      # push both :latest and the commit-tagged image.
+      # -----------------------------------------------------------------
+      - name: Build, tag and push image to Amazon ECR
+        id: build-image
+        shell: bash
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          set -euo pipefail
+          REPOSITORY_URI="$ECR_REGISTRY/$ECR_REPOSITORY"
+          COMMIT_HASH=$(echo "$GITHUB_SHA" | cut -c1-7)
+          IMAGE_TAG="${COMMIT_HASH:-latest}"
+
+          docker build \
+            --build-arg REACT_APP_BACKEND_URL="$REACT_APP_BACKEND_URL" \
+            -t "$REPOSITORY_URI:latest" .
+          docker tag "$REPOSITORY_URI:latest" "$REPOSITORY_URI:$IMAGE_TAG"
+
+          docker push "$REPOSITORY_URI:latest"
+          docker push "$REPOSITORY_URI:$IMAGE_TAG"
+
+          echo "image_uri=$REPOSITORY_URI:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------
+      # Pull the CURRENT live task definition from ECS, so nothing about
+      # its shape needs to be duplicated/hardcoded here.
+      # -----------------------------------------------------------------
+      - name: Download current ECS task definition
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ecs describe-task-definition \
+            --task-definition "$ECS_TASK_DEFINITION_FAMILY" \
+            --query "taskDefinition" \
+            --output json > task-definition.json
+
+      - name: Update image ID in task definition
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.ECS_CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image_uri }}
+
+      - name: Deploy new task definition to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          wait-for-service-stability: true
