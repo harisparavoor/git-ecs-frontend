@@ -94,9 +94,17 @@ jobs:
           node-version: '22'
           cache: 'npm'
 
-      #- name: Install dependencies
-       # shell: bash
-       # run: npm ci
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            npm ci
+          else
+            echo "WARNING: No package-lock.json/npm-shrinkwrap.json found."
+            echo "Falling back to 'npm install'. Commit a lock file for reproducible, faster CI builds."
+            npm install
+          fi
 
       # -----------------------------------------------------------------
       # AWS auth via OIDC -- no long-lived access keys stored anywhere.
