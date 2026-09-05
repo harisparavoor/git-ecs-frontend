@@ -94,9 +94,9 @@ jobs:
           node-version: '22'
           cache: 'npm'
 
-      - name: Install dependencies
-        shell: bash
-        run: npm ci
+      #- name: Install dependencies
+       # shell: bash
+       # run: npm ci
 
       # -----------------------------------------------------------------
       # AWS auth via OIDC -- no long-lived access keys stored anywhere.
