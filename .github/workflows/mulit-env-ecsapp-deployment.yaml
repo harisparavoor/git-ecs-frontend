@@ -9,8 +9,7 @@ on:
         options:
           - ""
           - dev
-          - sit
-          - stage
+          - staging
           - uat
           - prod
       branch:
@@ -53,8 +52,7 @@ jobs:
             case "$BRANCH" in
               prod)      ENVIRONMENT="prod" ;;
               uat)       ENVIRONMENT="uat" ;;
-              stage)     ENVIRONMENT="stage" ;;
-              sit)       ENVIRONMENT="sit" ;;
+              staging)     ENVIRONMENT="staging" ;;
               dev)       ENVIRONMENT="dev" ;;
               hotfix/*)  ENVIRONMENT="dev" ;;
               *)         ENVIRONMENT="dev" ;;   # unmapped branches default to dev
@@ -72,21 +70,18 @@ jobs:
           set -euo pipefail
           # "dev" is permissive: any branch (named or not) may deploy there.
           # Every other environment only accepts its own exactly-matching
-          # branch name (sit <- sit, stage <- stage, uat <- uat, prod <- prod).
+          # branch name (stage <- stage, uat <- uat, prod <- prod).
           if [[ "$ENVIRONMENT" != "dev" && "$BRANCH" != "$ENVIRONMENT" ]]; then
             echo "::error::Branch '$BRANCH' is not allowed to deploy to environment '$ENVIRONMENT'. Only the '$ENVIRONMENT' branch (or 'dev') may target it." >&2
             exit 1
           fi
           echo "Branch '$BRANCH' is authorized to deploy to '$ENVIRONMENT'."
-          # ---------------------------------------------------------------
-          # Convert lowercase environment to uppercase
-          # ---------------------------------------------------------------
 
   # ── Step 2: build, configure, and deploy — scoped to the resolved
   #    GitHub Environment, so vars.*/secrets.* below resolve to THAT
   #    environment's own stored values. ──
   deploy:
-    name: "Deploy ecs to ${{ needs.resolve-environment.outputs.environment }}"
+    name: "Deploy ECS to ${{ needs.resolve-environment.outputs.environment }}"
     needs: resolve-environment
     runs-on: ubuntu-24.04
     environment: ${{ needs.resolve-environment.outputs.environment }}
@@ -107,41 +102,75 @@ jobs:
       ECS_CONTAINER_NAME: ${{ vars.app }}
       ECR_REPOSITORY: "${{ vars.project_name }}-${{ vars.app }}-${{ needs.resolve-environment.outputs.environment }}"
       # Name of the ALB to look up at runtime (must match what Terraform created).
-      # Assumed naming convention below -- change if your ALB name differs.
       ALB_NAME: "${{ vars.project_name }}-${{ needs.resolve-environment.outputs.environment }}-alb"
       BACKEND_PORT: ${{ vars.BACKEND_PORT }}
 
     steps:
       # -----------------------------------------------------------------
-      # 0. Fail fast if any required repo Variable/Secret is missing.
+      # 0. Fail fast if any required repo Variable/Secret is missing —
+      #    common infra vars checked for every environment, then
+      #    environment-specific vars checked per branch below.
       # -----------------------------------------------------------------
       - name: Validate required configuration
         shell: bash
         env:
           AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+          TARGET_ENV: ${{ needs.resolve-environment.outputs.environment }}
         run: |
           set -euo pipefail
           missing=0
+
           check() {
-            if [ -z "${!1:-}" ]; then
-              echo "ERROR: required value '$1' is empty or not configured."
+            local name="$1"
+            local value="$2"
+            if [ -z "$value" ]; then
+              echo "::error::Missing required variable '$name' for environment '$TARGET_ENV'"
               missing=1
             fi
           }
-          check AWS_REGION
-          check ECR_REPOSITORY
-          check ECS_CLUSTER
-          check ECS_SERVICE
-          check ECS_TASK_DEFINITION_FAMILY
-          check ECS_CONTAINER_NAME
-          check ALB_NAME
-          check BACKEND_PORT
-          check AWS_ROLE_ARN
-          if [ "$missing" -eq 1 ]; then
-            echo "One or more required GitHub Variables/Secrets are missing. Aborting."
+
+          # ---- Common checks: required for every environment ----
+          echo "Validating common infra configuration..."
+          check "AWS_REGION"       "${{ vars.AWS_REGION }}"
+          check "project_name"     "${{ vars.project_name }}"
+          check "app"              "${{ vars.app }}"
+          check "BACKEND_PORT"     "${{ vars.BACKEND_PORT }}"
+          check "AWS_ROLE_ARN"     "${AWS_ROLE_ARN}"
+
+          # ---- Environment-specific checks ----
+          case "$TARGET_ENV" in
+            prod)
+              echo "Validating PROD variables..."
+              check "PROD_REACT_APP_API_URL"            "${{ vars.prod_ENV_TEST }}"
+              ;;
+
+            dev)
+              echo "Validating DEV variables..."
+              check "dev_REACT_APP_API_URL"            "${{ vars.dev_ENV_TEST }}"
+              ;;
+
+            staging)
+              echo "Validating STAGE variables..."
+              check "stage_REACT_APP_API_URL"            "${{ vars.stage_ENV_TEST }}"
+               ;;
+
+            uat)
+              echo "Validating UAT variables..."
+              check "uat_REACT_APP_API_URL"            "${{ vars.uat_ENV_TEST }}"
+              ;;
+
+            *)
+              echo "::error::Unknown environment '$TARGET_ENV' — no validation rules defined"
+              missing=1
+              ;;
+          esac
+
+          if [ "$missing" = "1" ]; then
+            echo "::error::One or more required variables are missing. Stopping pipeline."
             exit 1
           fi
-          echo "All required configuration values are present."
+
+          echo "All required configuration values are present for '$TARGET_ENV'."
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -186,6 +215,7 @@ jobs:
       - name: Get commit hash
         id: get-commit-hash
         run: echo "commit-hash=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
       # -----------------------------------------------------------------
       # Look up the ALB's live DNS name (created by Terraform) and build
       # REACT_APP_BACKEND_URL from it. This can't be a static repo Variable
@@ -202,7 +232,7 @@ jobs:
             --output text)
 
           if [ -z "$ALB_DNS" ] || [ "$ALB_DNS" == "None" ]; then
-            echo "ERROR: Could not resolve DNS name for ALB '$ALB_NAME'. Check ALB_NAME matches the actual load balancer name."
+            echo "::error::Could not resolve DNS name for ALB '$ALB_NAME'. Check ALB_NAME matches the actual load balancer name."
             exit 1
           fi
 
@@ -217,7 +247,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${REACT_APP_BACKEND_URL:-}" ]; then
-            echo "ERROR: REACT_APP_BACKEND_URL is empty. Check the previous ALB resolution step."
+            echo "::error::REACT_APP_BACKEND_URL is empty. Check the previous ALB resolution step."
             exit 1
           fi
           sed -i "s|{{REACT_APP_BACKEND_URL}}|$REACT_APP_BACKEND_URL|g" webpack.config.js
@@ -226,27 +256,28 @@ jobs:
 
       # -----------------------------------------------------------------
       # Build & push the Docker image, tag with :latest and short commit hash.
+      # Build ONCE with the commit-hash tag, then derive :latest from it.
       # -----------------------------------------------------------------
       - name: Build, tag and push image to Amazon ECR
         id: build-image
         shell: bash
         env:
           ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
-          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
           ENVIRONMENT: ${{ needs.resolve-environment.outputs.environment }}
           COMMIT_HASH: ${{ steps.get-commit-hash.outputs.commit-hash }}
         run: |
           set -euo pipefail
           REPOSITORY_URI="${ECR_REPOSITORY}"
           IMAGE_TAG="${ENVIRONMENT}-${COMMIT_HASH}"
-          LATEST_TAG="${ENVIRONMENT}-latest
+          LATEST_TAG="${ENVIRONMENT}-latest"
 
           echo "Repository URI: $REPOSITORY_URI"
           echo "Image tag     : $IMAGE_TAG"
 
           docker build \
             --build-arg REACT_APP_BACKEND_URL="$REACT_APP_BACKEND_URL" \
-            -t "$REPOSITORY_URI:latest" .
+            -t "$REPOSITORY_URI:$IMAGE_TAG" .
+
           docker tag "${REPOSITORY_URI}:${IMAGE_TAG}" "${REPOSITORY_URI}:${LATEST_TAG}"
 
           docker push "${REPOSITORY_URI}:${IMAGE_TAG}"
