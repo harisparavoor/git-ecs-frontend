@@ -267,7 +267,7 @@ jobs:
           COMMIT_HASH: ${{ steps.get-commit-hash.outputs.commit-hash }}
         run: |
           set -euo pipefail
-          REPOSITORY_URI="${ECR_REPOSITORY}"
+          REPOSITORY_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}"
           IMAGE_TAG="${ENVIRONMENT}-${COMMIT_HASH}"
           LATEST_TAG="${ENVIRONMENT}-latest"
 
