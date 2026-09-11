@@ -1,24 +1,9 @@
 name: multi-env-ecsapp-deployment
-# -------------------------------------------------------------------------
-# Environment selection
-#
-# Explicit environment input wins.
-# Otherwise:
-#
-#   prod       -> prod
-#   uat        -> uat
-#   staging    -> staging
-#   sit        -> sit
-#   dev        -> dev
-#   hotfix/*   -> dev
-#   anything   -> dev
-# -------------------------------------------------------------------------
-
 on:
   workflow_dispatch:
     inputs:
       environment:
-        description: "Target environment (blank = infer from branch)"
+        description: "Target environment (leave blank to infer from branch)"
         required: false
         type: choice
         options:
@@ -26,13 +11,10 @@ on:
           - dev
           - staging
           - uat
-          - sit
           - prod
-
       branch:
-        description: "Branch to deploy (blank = current workflow branch)"
+        description: "Branch to deploy (defaults to the branch this workflow is run from)"
         required: false
-        type: string
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -42,126 +24,70 @@ permissions:
   contents: read
 
 jobs:
-
-  # =========================================================================
-  # JOB 1: Resolve environment
-  # =========================================================================
-
+  # ── Step 1: work out WHICH environment and WHICH branch we're deploying,
+  #    and validate the branch is allowed to target it. No AWS/deploy
+  #    access happens in this job (it has no `environment:` set). ──
   resolve-environment:
     name: Resolve target environment
     runs-on: ubuntu-24.04
-
     outputs:
       environment: ${{ steps.resolve.outputs.environment }}
-      environment_upper: ${{ steps.resolve.outputs.environment_upper }}
       branch: ${{ steps.resolve.outputs.branch }}
-
     steps:
-
       - name: Resolve environment and branch
         id: resolve
-        shell: bash
         env:
           INPUT_ENVIRONMENT: ${{ inputs.environment }}
           INPUT_BRANCH: ${{ inputs.branch }}
           TRIGGER_REF_NAME: ${{ github.ref_name }}
-
         run: |
           set -euo pipefail
 
-          # ---------------------------------------------------------------
-          # Determine branch
-          # ---------------------------------------------------------------
-
           BRANCH="${INPUT_BRANCH:-$TRIGGER_REF_NAME}"
-
-          if [[ -z "$BRANCH" ]]; then
-            echo "::error::Branch could not be determined."
-            exit 1
-          fi
-
-          # ---------------------------------------------------------------
-          # Explicit environment wins
-          # ---------------------------------------------------------------
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
 
           if [[ -n "$INPUT_ENVIRONMENT" ]]; then
-
             ENVIRONMENT="$INPUT_ENVIRONMENT"
-
           else
-
             case "$BRANCH" in
-              prod)
-                ENVIRONMENT="prod"
-                ;;
-
-              uat)
-                ENVIRONMENT="uat"
-                ;;
-
-              staging)
-                ENVIRONMENT="staging"
-                ;;
-
-              sit)
-                ENVIRONMENT="sit"
-                ;;
-
-              dev)
-                ENVIRONMENT="dev"
-                ;;
-
-              hotfix/*)
-                ENVIRONMENT="dev"
-                ;;
-
-              *)
-                # Any unrecognized branch -> DEV
-                ENVIRONMENT="dev"
-                ;;
+              prod)      ENVIRONMENT="prod" ;;
+              uat)       ENVIRONMENT="uat" ;;
+              staging)     ENVIRONMENT="staging" ;;
+              dev)       ENVIRONMENT="dev" ;;
+              hotfix/*)  ENVIRONMENT="dev" ;;
+              *)         ENVIRONMENT="dev" ;;   # unmapped branches default to dev
             esac
-
           fi
 
-          # ---------------------------------------------------------------
-          # Convert lowercase environment to uppercase
-          # ---------------------------------------------------------------
-
-          ENVIRONMENT_UPPER="${ENVIRONMENT^^}"
-
-          echo "Branch            : $BRANCH"
-          echo "Environment       : $ENVIRONMENT"
-          echo "Environment upper : $ENVIRONMENT_UPPER"
-
-          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "Resolved branch=$BRANCH environment=$ENVIRONMENT"
           echo "environment=$ENVIRONMENT" >> "$GITHUB_OUTPUT"
-          echo "environment_upper=$ENVIRONMENT_UPPER" >> "$GITHUB_OUTPUT"
 
+      - name: Validate branch is allowed to deploy to this environment
+        env:
+          ENVIRONMENT: ${{ steps.resolve.outputs.environment }}
+          BRANCH: ${{ steps.resolve.outputs.branch }}
+        run: |
+          set -euo pipefail
+          # "dev" is permissive: any branch (named or not) may deploy there.
+          # Every other environment only accepts its own exactly-matching
+          # branch name (stage <- stage, uat <- uat, prod <- prod).
+          if [[ "$ENVIRONMENT" != "dev" && "$BRANCH" != "$ENVIRONMENT" ]]; then
+            echo "::error::Branch '$BRANCH' is not allowed to deploy to environment '$ENVIRONMENT'. Only the '$ENVIRONMENT' branch (or 'dev') may target it." >&2
+            exit 1
+          fi
+          echo "Branch '$BRANCH' is authorized to deploy to '$ENVIRONMENT'."
 
-  # =========================================================================
-  # JOB 2: Build, Push & Deploy
-  # =========================================================================
-
+  # ── Step 2: build, configure, and deploy — scoped to the resolved
+  #    GitHub Environment, so vars.*/secrets.* below resolve to THAT
+  #    environment's own stored values. ──
   deploy:
-    name: Build, Push & Deploy to ${{ needs.resolve-environment.outputs.environment }}
-
-    needs:
-      - resolve-environment
-
-    runs-on: ubuntu-latest
-
-    # -----------------------------------------------------------------------
-    # Optional GitHub Environment protection.
-    # The resolved environment is attached here, so e.g. PROD can have
-    # required reviewers/protection rules configured in repo settings.
-    # -----------------------------------------------------------------------
-    environment:
-      name: ${{ needs.resolve-environment.outputs.environment }}
-
+    name: "Deploy ECS to ${{ needs.resolve-environment.outputs.environment }}"
+    needs: resolve-environment
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.resolve-environment.outputs.environment }}
     concurrency:
-      group: ecs-infra-deploy-${{ needs.resolve-environment.outputs.environment }}
+      group: ECS-deploy-${{ needs.resolve-environment.outputs.environment }}
       cancel-in-progress: false
-
     permissions:
       id-token: write
       contents: read
@@ -176,41 +102,75 @@ jobs:
       ECS_CONTAINER_NAME: ${{ vars.app }}
       ECR_REPOSITORY: "${{ vars.project_name }}-${{ vars.app }}-${{ needs.resolve-environment.outputs.environment }}"
       # Name of the ALB to look up at runtime (must match what Terraform created).
-      # Assumed naming convention below -- change if your ALB name differs.
       ALB_NAME: "${{ vars.project_name }}-${{ needs.resolve-environment.outputs.environment }}-alb"
       BACKEND_PORT: ${{ vars.BACKEND_PORT }}
 
     steps:
       # -----------------------------------------------------------------
-      # 0. Fail fast if any required repo Variable/Secret is missing.
+      # 0. Fail fast if any required repo Variable/Secret is missing —
+      #    common infra vars checked for every environment, then
+      #    environment-specific vars checked per branch below.
       # -----------------------------------------------------------------
       - name: Validate required configuration
         shell: bash
         env:
           AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+          TARGET_ENV: ${{ needs.resolve-environment.outputs.environment }}
         run: |
           set -euo pipefail
           missing=0
+
           check() {
-            if [ -z "${!1:-}" ]; then
-              echo "ERROR: required value '$1' is empty or not configured."
+            local name="$1"
+            local value="$2"
+            if [ -z "$value" ]; then
+              echo "::error::Missing required variable '$name' for environment '$TARGET_ENV'"
               missing=1
             fi
           }
-          check AWS_REGION
-          check ECR_REPOSITORY
-          check ECS_CLUSTER
-          check ECS_SERVICE
-          check ECS_TASK_DEFINITION_FAMILY
-          check ECS_CONTAINER_NAME
-          check ALB_NAME
-          check BACKEND_PORT
-          check AWS_ROLE_ARN
-          if [ "$missing" -eq 1 ]; then
-            echo "One or more required GitHub Variables/Secrets are missing. Aborting."
+
+          # ---- Common checks: required for every environment ----
+          echo "Validating common infra configuration..."
+          check "AWS_REGION"       "${{ vars.AWS_REGION }}"
+          check "project_name"     "${{ vars.project_name }}"
+          check "app"              "${{ vars.app }}"
+          check "BACKEND_PORT"     "${{ vars.BACKEND_PORT }}"
+          check "AWS_ROLE_ARN"     "${AWS_ROLE_ARN}"
+
+          # ---- Environment-specific checks ----
+          case "$TARGET_ENV" in
+            prod)
+              echo "Validating PROD variables..."
+              check "PROD_REACT_APP_API_URL"            "${{ vars.prod_ENV_TEST }}"
+              ;;
+
+            dev)
+              echo "Validating DEV variables..."
+              check "dev_REACT_APP_API_URL"            "${{ vars.dev_ENV_TEST }}"
+              ;;
+
+            staging)
+              echo "Validating STAGE variables..."
+              check "stage_REACT_APP_API_URL"            "${{ vars.stage_ENV_TEST }}"
+               ;;
+
+            uat)
+              echo "Validating UAT variables..."
+              check "uat_REACT_APP_API_URL"            "${{ vars.uat_ENV_TEST }}"
+              ;;
+
+            *)
+              echo "::error::Unknown environment '$TARGET_ENV' — no validation rules defined"
+              missing=1
+              ;;
+          esac
+
+          if [ "$missing" = "1" ]; then
+            echo "::error::One or more required variables are missing. Stopping pipeline."
             exit 1
           fi
-          echo "All required configuration values are present."
+
+          echo "All required configuration values are present for '$TARGET_ENV'."
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -252,6 +212,10 @@ jobs:
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
+      - name: Get commit hash
+        id: get-commit-hash
+        run: echo "commit-hash=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
       # -----------------------------------------------------------------
       # Look up the ALB's live DNS name (created by Terraform) and build
       # REACT_APP_BACKEND_URL from it. This can't be a static repo Variable
@@ -268,7 +232,7 @@ jobs:
             --output text)
 
           if [ -z "$ALB_DNS" ] || [ "$ALB_DNS" == "None" ]; then
-            echo "ERROR: Could not resolve DNS name for ALB '$ALB_NAME'. Check ALB_NAME matches the actual load balancer name."
+            echo "::error::Could not resolve DNS name for ALB '$ALB_NAME'. Check ALB_NAME matches the actual load balancer name."
             exit 1
           fi
 
@@ -283,7 +247,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${REACT_APP_BACKEND_URL:-}" ]; then
-            echo "ERROR: REACT_APP_BACKEND_URL is empty. Check the previous ALB resolution step."
+            echo "::error::REACT_APP_BACKEND_URL is empty. Check the previous ALB resolution step."
             exit 1
           fi
           sed -i "s|{{REACT_APP_BACKEND_URL}}|$REACT_APP_BACKEND_URL|g" webpack.config.js
@@ -292,25 +256,32 @@ jobs:
 
       # -----------------------------------------------------------------
       # Build & push the Docker image, tag with :latest and short commit hash.
+      # Build ONCE with the commit-hash tag, then derive :latest from it.
       # -----------------------------------------------------------------
       - name: Build, tag and push image to Amazon ECR
         id: build-image
         shell: bash
         env:
           ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          ENVIRONMENT: ${{ needs.resolve-environment.outputs.environment }}
+          COMMIT_HASH: ${{ steps.get-commit-hash.outputs.commit-hash }}
         run: |
           set -euo pipefail
-          REPOSITORY_URI="$ECR_REGISTRY/$ECR_REPOSITORY"
-          COMMIT_HASH=$(echo "$GITHUB_SHA" | cut -c1-7)
-          IMAGE_TAG="${COMMIT_HASH:-latest}"
+          REPOSITORY_URI="${ECR_REPOSITORY}"
+          IMAGE_TAG="${ENVIRONMENT}-${COMMIT_HASH}"
+          LATEST_TAG="${ENVIRONMENT}-latest"
+
+          echo "Repository URI: $REPOSITORY_URI"
+          echo "Image tag     : $IMAGE_TAG"
 
           docker build \
             --build-arg REACT_APP_BACKEND_URL="$REACT_APP_BACKEND_URL" \
-            -t "$REPOSITORY_URI:latest" .
-          docker tag "$REPOSITORY_URI:latest" "$REPOSITORY_URI:$IMAGE_TAG"
+            -t "$REPOSITORY_URI:$IMAGE_TAG" .
 
-          docker push "$REPOSITORY_URI:latest"
-          docker push "$REPOSITORY_URI:$IMAGE_TAG"
+          docker tag "${REPOSITORY_URI}:${IMAGE_TAG}" "${REPOSITORY_URI}:${LATEST_TAG}"
+
+          docker push "${REPOSITORY_URI}:${IMAGE_TAG}"
+          docker push "${REPOSITORY_URI}:${LATEST_TAG}"
 
           echo "image_uri=$REPOSITORY_URI:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
 
@@ -336,6 +307,7 @@ jobs:
           image: ${{ steps.build-image.outputs.image_uri }}
 
       - name: Deploy new task definition to ECS
+        id: deploy-ecs
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
           task-definition: ${{ steps.render-task-def.outputs.task-definition }}
