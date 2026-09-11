@@ -1,0 +1,344 @@
+name: multi-env-ecsapp-deployment
+# -------------------------------------------------------------------------
+# Environment selection
+#
+# Explicit environment input wins.
+# Otherwise:
+#
+#   prod       -> prod
+#   uat        -> uat
+#   staging    -> staging
+#   sit        -> sit
+#   dev        -> dev
+#   hotfix/*   -> dev
+#   anything   -> dev
+# -------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment (blank = infer from branch)"
+        required: false
+        type: choice
+        options:
+          - ""
+          - dev
+          - staging
+          - uat
+          - sit
+          - prod
+
+      branch:
+        description: "Branch to deploy (blank = current workflow branch)"
+        required: false
+        type: string
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+
+  # =========================================================================
+  # JOB 1: Resolve environment
+  # =========================================================================
+
+  resolve-environment:
+    name: Resolve target environment
+    runs-on: ubuntu-24.04
+
+    outputs:
+      environment: ${{ steps.resolve.outputs.environment }}
+      environment_upper: ${{ steps.resolve.outputs.environment_upper }}
+      branch: ${{ steps.resolve.outputs.branch }}
+
+    steps:
+
+      - name: Resolve environment and branch
+        id: resolve
+        shell: bash
+        env:
+          INPUT_ENVIRONMENT: ${{ inputs.environment }}
+          INPUT_BRANCH: ${{ inputs.branch }}
+          TRIGGER_REF_NAME: ${{ github.ref_name }}
+
+        run: |
+          set -euo pipefail
+
+          # ---------------------------------------------------------------
+          # Determine branch
+          # ---------------------------------------------------------------
+
+          BRANCH="${INPUT_BRANCH:-$TRIGGER_REF_NAME}"
+
+          if [[ -z "$BRANCH" ]]; then
+            echo "::error::Branch could not be determined."
+            exit 1
+          fi
+
+          # ---------------------------------------------------------------
+          # Explicit environment wins
+          # ---------------------------------------------------------------
+
+          if [[ -n "$INPUT_ENVIRONMENT" ]]; then
+
+            ENVIRONMENT="$INPUT_ENVIRONMENT"
+
+          else
+
+            case "$BRANCH" in
+              prod)
+                ENVIRONMENT="prod"
+                ;;
+
+              uat)
+                ENVIRONMENT="uat"
+                ;;
+
+              staging)
+                ENVIRONMENT="staging"
+                ;;
+
+              sit)
+                ENVIRONMENT="sit"
+                ;;
+
+              dev)
+                ENVIRONMENT="dev"
+                ;;
+
+              hotfix/*)
+                ENVIRONMENT="dev"
+                ;;
+
+              *)
+                # Any unrecognized branch -> DEV
+                ENVIRONMENT="dev"
+                ;;
+            esac
+
+          fi
+
+          # ---------------------------------------------------------------
+          # Convert lowercase environment to uppercase
+          # ---------------------------------------------------------------
+
+          ENVIRONMENT_UPPER="${ENVIRONMENT^^}"
+
+          echo "Branch            : $BRANCH"
+          echo "Environment       : $ENVIRONMENT"
+          echo "Environment upper : $ENVIRONMENT_UPPER"
+
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "environment=$ENVIRONMENT" >> "$GITHUB_OUTPUT"
+          echo "environment_upper=$ENVIRONMENT_UPPER" >> "$GITHUB_OUTPUT"
+
+
+  # =========================================================================
+  # JOB 2: Build, Push & Deploy
+  # =========================================================================
+
+  deploy:
+    name: Build, Push & Deploy to ${{ needs.resolve-environment.outputs.environment }}
+
+    needs:
+      - resolve-environment
+
+    runs-on: ubuntu-latest
+
+    # -----------------------------------------------------------------------
+    # Optional GitHub Environment protection.
+    # The resolved environment is attached here, so e.g. PROD can have
+    # required reviewers/protection rules configured in repo settings.
+    # -----------------------------------------------------------------------
+    environment:
+      name: ${{ needs.resolve-environment.outputs.environment }}
+
+    concurrency:
+      group: ecs-infra-deploy-${{ needs.resolve-environment.outputs.environment }}
+      cancel-in-progress: false
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      TF_IN_AUTOMATION: true
+      TF_INPUT: false
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECS_CLUSTER: "${{ vars.project_name }}-${{ needs.resolve-environment.outputs.environment }}-cluster"
+      ECS_SERVICE: "${{ vars.project_name }}-${{ needs.resolve-environment.outputs.environment }}-${{ vars.app }}-service"
+      ECS_TASK_DEFINITION_FAMILY: "${{ vars.project_name }}-${{ vars.app }}-${{ needs.resolve-environment.outputs.environment }}"
+      ECS_CONTAINER_NAME: ${{ vars.app }}
+      ECR_REPOSITORY: "${{ vars.project_name }}-${{ vars.app }}-${{ needs.resolve-environment.outputs.environment }}"
+      # Name of the ALB to look up at runtime (must match what Terraform created).
+      # Assumed naming convention below -- change if your ALB name differs.
+      ALB_NAME: "${{ vars.project_name }}-${{ needs.resolve-environment.outputs.environment }}-alb"
+      BACKEND_PORT: ${{ vars.BACKEND_PORT }}
+
+    steps:
+      # -----------------------------------------------------------------
+      # 0. Fail fast if any required repo Variable/Secret is missing.
+      # -----------------------------------------------------------------
+      - name: Validate required configuration
+        shell: bash
+        env:
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          missing=0
+          check() {
+            if [ -z "${!1:-}" ]; then
+              echo "ERROR: required value '$1' is empty or not configured."
+              missing=1
+            fi
+          }
+          check AWS_REGION
+          check ECR_REPOSITORY
+          check ECS_CLUSTER
+          check ECS_SERVICE
+          check ECS_TASK_DEFINITION_FAMILY
+          check ECS_CONTAINER_NAME
+          check ALB_NAME
+          check BACKEND_PORT
+          check AWS_ROLE_ARN
+          if [ "$missing" -eq 1 ]; then
+            echo "One or more required GitHub Variables/Secrets are missing. Aborting."
+            exit 1
+          fi
+          echo "All required configuration values are present."
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-environment.outputs.branch }}
+          fetch-depth: 0
+
+      # -----------------------------------------------------------------
+      # Optional sanity build of the app before containerizing.
+      # Remove this step if your Docker build already handles install/build.
+      # -----------------------------------------------------------------
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            npm ci
+          else
+            echo "WARNING: No package-lock.json/npm-shrinkwrap.json found."
+            echo "Falling back to 'npm install'. Commit a lock file for reproducible, faster CI builds."
+            npm install
+          fi
+
+      # -----------------------------------------------------------------
+      # AWS auth via OIDC -- no long-lived access keys stored anywhere.
+      # -----------------------------------------------------------------
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # -----------------------------------------------------------------
+      # Look up the ALB's live DNS name (created by Terraform) and build
+      # REACT_APP_BACKEND_URL from it. This can't be a static repo Variable
+      # since the DNS name only exists once the ALB is provisioned --
+      # it's fetched fresh from AWS on every run instead.
+      # -----------------------------------------------------------------
+      - name: Resolve backend URL from ALB DNS name
+        shell: bash
+        run: |
+          set -euo pipefail
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --names "$ALB_NAME" \
+            --query "LoadBalancers[0].DNSName" \
+            --output text)
+
+          if [ -z "$ALB_DNS" ] || [ "$ALB_DNS" == "None" ]; then
+            echo "ERROR: Could not resolve DNS name for ALB '$ALB_NAME'. Check ALB_NAME matches the actual load balancer name."
+            exit 1
+          fi
+
+          echo "Resolved ALB DNS: $ALB_DNS"
+          echo "REACT_APP_BACKEND_URL=http://${ALB_DNS}:${BACKEND_PORT}" >> "$GITHUB_ENV"
+
+      # -----------------------------------------------------------------
+      # Replace placeholder in webpack.config.js with the real backend URL.
+      # -----------------------------------------------------------------
+      - name: Replace placeholders in webpack.config.js
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${REACT_APP_BACKEND_URL:-}" ]; then
+            echo "ERROR: REACT_APP_BACKEND_URL is empty. Check the previous ALB resolution step."
+            exit 1
+          fi
+          sed -i "s|{{REACT_APP_BACKEND_URL}}|$REACT_APP_BACKEND_URL|g" webpack.config.js
+          echo "webpack.config.js after replacement:"
+          cat webpack.config.js
+
+      # -----------------------------------------------------------------
+      # Build & push the Docker image, tag with :latest and short commit hash.
+      # -----------------------------------------------------------------
+      - name: Build, tag and push image to Amazon ECR
+        id: build-image
+        shell: bash
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          set -euo pipefail
+          REPOSITORY_URI="$ECR_REGISTRY/$ECR_REPOSITORY"
+          COMMIT_HASH=$(echo "$GITHUB_SHA" | cut -c1-7)
+          IMAGE_TAG="${COMMIT_HASH:-latest}"
+
+          docker build \
+            --build-arg REACT_APP_BACKEND_URL="$REACT_APP_BACKEND_URL" \
+            -t "$REPOSITORY_URI:latest" .
+          docker tag "$REPOSITORY_URI:latest" "$REPOSITORY_URI:$IMAGE_TAG"
+
+          docker push "$REPOSITORY_URI:latest"
+          docker push "$REPOSITORY_URI:$IMAGE_TAG"
+
+          echo "image_uri=$REPOSITORY_URI:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------
+      # Pull the CURRENT live task definition from ECS, so nothing about
+      # its shape needs to be duplicated/hardcoded here.
+      # -----------------------------------------------------------------
+      - name: Download current ECS task definition
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ecs describe-task-definition \
+            --task-definition "$ECS_TASK_DEFINITION_FAMILY" \
+            --query "taskDefinition" \
+            --output json > task-definition.json
+
+      - name: Update image ID in task definition
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.ECS_CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image_uri }}
+
+      - name: Deploy new task definition to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          wait-for-service-stability: true
